@@ -143,8 +143,20 @@ export function* generateComponent(
 			if (identifierRE.test(camelize(tag))) {
 				// navigation support
 				yield `/** @ts-ignore @type {`;
+				const matchedSetupBinding = [...originalNames].find(name => options.setupBindings.has(name));
 				for (const offset of [startTagOffset, endTagOffset]) {
 					if (offset === undefined) {
+						continue;
+					}
+					if (matchedSetupBinding) {
+						// Synthetic LocalComponents properties have no source mapping to the setup binding.
+						yield ` | typeof `;
+						yield* generateCamelized(
+							matchedSetupBinding[0]! + tag.slice(1),
+							'template',
+							offset,
+							codeFeatures.navigation,
+						);
 						continue;
 					}
 					yield ` | typeof ${names.components}.`;
