@@ -5,74 +5,88 @@ import { startLanguageServer } from '@volar/test-utils';
 import * as path from 'node:path';
 import { URI } from 'vscode-uri';
 
-let serverHandle: LanguageServerHandle | undefined;
-let tsserver: import('@typescript/server-harness').Server;
+type TestServer = {
+	vueserver: LanguageServerHandle;
+	tsserver: import('@typescript/server-harness').Server;
+	nextSeq: () => number;
+	holdNextComponentMeta: () => { started: Promise<void>; release: () => void };
+	open: (uri: string, languageId: string, content: string) => Promise<TextDocument>;
+	close: (uri: string) => Promise<void>;
+};
+
+const servers = new Map<string, Promise<TestServer>>();
 let seq = 1;
 
 export const testWorkspacePath = path.resolve(__dirname, '../../../test-workspace');
 
-export async function getLanguageServer(): Promise<{
-	vueserver: LanguageServerHandle;
-	tsserver: import('@typescript/server-harness').Server;
-	nextSeq: () => number;
-	open: (uri: string, languageId: string, content: string) => Promise<TextDocument>;
-	close: (uri: string) => Promise<void>;
-}> {
-	if (!serverHandle) {
-		tsserver = launchServer(
-			require.resolve('typescript/lib/tsserver', {
-				paths: [path.dirname(require.resolve('typescript/package.json'))],
-			}),
-			[
-				'--disableAutomaticTypingAcquisition',
-				'--globalPlugins',
-				'@vue/typescript-plugin',
-				'--pluginProbeLocations',
-				path.join(__dirname, '..'),
-				'--suppressDiagnosticEvents',
-				// '--logVerbosity', 'verbose',
-				// '--logFile', path.join(__dirname, 'tsserver.log'),
-			],
-		);
-
-		tsserver.on('exit', code => console.log(code ? `Exited with code ${code}` : `Terminated`));
-		// tsserver.on('event', e => console.log(e));
-
-		serverHandle = startLanguageServer(require.resolve('../index.js'), testWorkspacePath);
-		serverHandle.connection.onNotification(PublishDiagnosticsNotification.type, () => {});
-		serverHandle.connection.onRequest(ConfigurationRequest.type, ({ items }) => {
-			return items.map(({ section }) => {
-				if (section?.startsWith('vue.inlayHints.')) {
-					return true;
-				}
-				return null;
-			});
-		});
-		serverHandle.connection.onNotification('tsserver/request', ([id, command, args]) => {
-			tsserver.message({
-				seq: seq++,
-				command: command,
-				arguments: args,
-			}).then(
-				res => serverHandle!.connection.sendNotification('tsserver/response', [id, res?.body]),
-				() => serverHandle!.connection.sendNotification('tsserver/response', [id, undefined]),
-			);
-		});
-
-		await serverHandle.initialize(
-			URI.file(testWorkspacePath).toString(),
-			{},
-			{
-				workspace: {
-					configuration: true,
-				},
-			},
-		);
+export function getLanguageServer(options: { capability?: number; rich?: boolean } = {}): Promise<TestServer> {
+	const key = `${options.capability ?? 'none'}:${options.rich ?? 'unset'}`;
+	let server = servers.get(key);
+	if (!server) {
+		server = startTestServer(options);
+		servers.set(key, server);
 	}
+	return server;
+}
+
+async function startTestServer(options: { capability?: number; rich?: boolean }): Promise<TestServer> {
+	const tsserver = launchServer(
+		require.resolve('typescript/lib/tsserver', {
+			paths: [path.dirname(require.resolve('typescript/package.json'))],
+		}),
+		[
+			'--disableAutomaticTypingAcquisition',
+			'--globalPlugins',
+			'@vue/typescript-plugin',
+			'--pluginProbeLocations',
+			path.join(__dirname, '..'),
+			'--suppressDiagnosticEvents',
+		],
+	);
+	const vueserver = startLanguageServer(require.resolve('../index.js'), testWorkspacePath);
+	let nextComponentMetaPause: { started: () => void; released: Promise<void> } | undefined;
+	vueserver.connection.onNotification(PublishDiagnosticsNotification.type, () => {});
+	vueserver.connection.onRequest(ConfigurationRequest.type, ({ items }) => {
+		return items.map(({ section }) => {
+			if (section?.startsWith('vue.inlayHints.')) return true;
+			if (section === 'vue.hover.rich') return options.rich ?? null;
+			return null;
+		});
+	});
+	vueserver.connection.onNotification('tsserver/request', async ([id, command, args]) => {
+		if (command === '_vue:getComponentMeta' && nextComponentMetaPause) {
+			const pause = nextComponentMetaPause;
+			nextComponentMetaPause = undefined;
+			pause.started();
+			await pause.released;
+		}
+		tsserver.message({ seq: seq++, command, arguments: args }).then(
+			res => vueserver.connection.sendNotification('tsserver/response', [id, res?.body]),
+			() => vueserver.connection.sendNotification('tsserver/response', [id, undefined]),
+		);
+	});
+	await vueserver.initialize(
+		URI.file(testWorkspacePath).toString(),
+		{},
+		{
+			workspace: { configuration: true },
+			...(options.capability === undefined
+				? {}
+				: { experimental: { zedraComponentHover: { version: options.capability } } }),
+		},
+	);
 	return {
-		vueserver: serverHandle,
-		tsserver: tsserver,
+		vueserver,
+		tsserver,
 		nextSeq: () => seq++,
+		holdNextComponentMeta: () => {
+			let started!: () => void;
+			let release!: () => void;
+			const startedPromise = new Promise<void>(resolve => started = resolve);
+			const released = new Promise<void>(resolve => release = resolve);
+			nextComponentMetaPause = { started, released };
+			return { started: startedPromise, release };
+		},
 		open: async (uri, languageId, content) => {
 			if (uri.startsWith('file://')) {
 				const res = await tsserver.message({
@@ -82,19 +96,12 @@ export async function getLanguageServer(): Promise<{
 					arguments: {
 						changedFiles: [],
 						closedFiles: [],
-						openFiles: [
-							{
-								file: URI.parse(uri).fsPath,
-								fileContent: content,
-							},
-						],
+						openFiles: [{ file: URI.parse(uri).fsPath, fileContent: content }],
 					},
 				});
-				if (!res.success) {
-					throw new Error(res.body);
-				}
+				if (!res.success) throw new Error(res.body);
 			}
-			return await serverHandle!.openInMemoryDocument(uri, languageId, content);
+			return await vueserver.openInMemoryDocument(uri, languageId, content);
 		},
 		close: async uri => {
 			if (uri.startsWith('file://')) {
@@ -102,17 +109,11 @@ export async function getLanguageServer(): Promise<{
 					seq: seq++,
 					type: 'request',
 					command: 'updateOpen',
-					arguments: {
-						changedFiles: [],
-						closedFiles: [URI.parse(uri).fsPath],
-						openFiles: [],
-					},
+					arguments: { changedFiles: [], closedFiles: [URI.parse(uri).fsPath], openFiles: [] },
 				});
-				if (!res.success) {
-					throw new Error(res.body);
-				}
+				if (!res.success) throw new Error(res.body);
 			}
-			await serverHandle!.closeTextDocument(uri);
+			await vueserver.closeTextDocument(uri);
 		},
 	};
 }

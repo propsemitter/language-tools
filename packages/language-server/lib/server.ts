@@ -6,6 +6,8 @@ import {
 	createParsedCommandLine,
 	createParsedCommandLineByJson,
 	createVueLanguagePlugin,
+	findComponentTagAtOffset,
+	type VueVirtualCode,
 } from '@vue/language-core';
 import {
 	createLanguageService,
@@ -13,6 +15,11 @@ import {
 	createVueLanguageServicePlugins,
 	type LanguageService,
 } from '@vue/language-service';
+import {
+	createZedraComponentHover,
+	formatZedraComponentHover,
+	type ZedraComponentMeta,
+} from '@vue/language-service/lib/zedraComponentHover';
 import type * as ts from 'typescript';
 import { URI } from 'vscode-uri';
 
@@ -32,6 +39,10 @@ export function startServer(ts: typeof import('typescript')) {
 
 	connection.onInitialize(params => {
 		const tsconfigProjects = createUriMap<LanguageService>();
+		const experimentalCapabilities = params.capabilities.experimental as {
+			zedraComponentHover?: { version?: unknown };
+		} | undefined;
+		const componentHoverVersion = experimentalCapabilities?.zedraComponentHover?.version === 1 ? 1 : undefined;
 		const file2ProjectInfo = new Map<string, Promise<ts.server.protocol.ProjectInfo | null>>();
 
 		server.fileWatcher.onDidChangeWatchedFiles(({ changes }) => {
@@ -213,12 +224,69 @@ export function startServer(ts: typeof import('typescript')) {
 					}
 				},
 			);
-			return createLanguageService(
+			const languageService = createLanguageService(
 				language,
 				server.languageServicePlugins,
 				createLanguageServiceEnvironment(server, [...server.workspaceFolders.all]),
 				{},
 			);
+			if (componentHoverVersion === 1) {
+				const getHover = languageService.getHover;
+				languageService.getHover = async (uri, position, token) => {
+					if (token?.isCancellationRequested) {
+						return;
+					}
+					const documentBeforeConfiguration = server.documents.get(uri);
+					const versionBeforeConfiguration = documentBeforeConfiguration?.version;
+					const richHover = await languageService.context.env.getConfiguration?.('vue.hover.rich');
+					if (
+						token?.isCancellationRequested
+						|| server.documents.get(uri) !== documentBeforeConfiguration
+						|| documentBeforeConfiguration?.version !== versionBeforeConfiguration
+					) {
+						return;
+					}
+					if (richHover === false) {
+						return getHover(uri, position, token);
+					}
+					const document = server.documents.get(uri);
+					if (!document || document.languageId !== 'vue') {
+						return getHover(uri, position, token);
+					}
+					const documentVersion = document.version;
+					const sourceScript = language.scripts.get(uri);
+					const root = sourceScript?.generated?.root as VueVirtualCode | undefined;
+					const template = root?.ir.template;
+					const offset = document.offsetAt(position);
+					const match = template?.lang === 'html' && template.ast
+						? findComponentTagAtOffset(template.ast, template.startTagEnd, offset)
+						: undefined;
+					if (!root || !match) {
+						return getHover(uri, position, token);
+					}
+					const meta = await sendTsServerRequest<ZedraComponentMeta>('_vue:getComponentMeta', [
+						root.fileName,
+						match.name,
+					]);
+					if (
+						token?.isCancellationRequested
+						|| server.documents.get(uri) !== document
+						|| document.version !== documentVersion
+					) {
+						return;
+					}
+					if (!meta) {
+						return getHover(uri, position, token);
+					}
+					const component = createZedraComponentHover(meta, match.name);
+					return {
+						contents: { kind: 'markdown', value: formatZedraComponentHover(component) },
+						range: { start: document.positionAt(match.start), end: document.positionAt(match.end) },
+						zedraComponent: component,
+					} as Awaited<ReturnType<typeof getHover>>;
+				};
+			}
+			return languageService;
 		}
 	});
 
